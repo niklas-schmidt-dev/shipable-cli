@@ -1,0 +1,198 @@
+name: publish-cli-npm
+run-name: Publish Shipable CLI to npm
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: publish-cli-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.26.3"
+  NODE_VERSION: "26"
+  NPM_CLI_VERSION: "11.16.0"
+
+jobs:
+  preflight:
+    name: Blacksmith release preflight
+    permissions:
+      contents: read
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Import release signing public key
+        shell: bash
+        env:
+          RELEASE_GPG_PUBLIC_KEY_B64: ${{ vars.SHIPABLE_RELEASE_GPG_PUBLIC_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_GPG_PUBLIC_KEY_B64}" ]; then
+            echo "Set repository variable SHIPABLE_RELEASE_GPG_PUBLIC_KEY_B64 to the armored release signing public key encoded as base64." >&2
+            exit 1
+          fi
+          printf '%s' "${RELEASE_GPG_PUBLIC_KEY_B64}" | base64 -d | gpg --batch --import
+
+      - name: Verify signed release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "This workflow only publishes tag refs." >&2
+            exit 1
+          fi
+          git fetch --force --tags origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" != "tag" ]; then
+            echo "Release ref ${GITHUB_REF_NAME} must be an annotated signed tag." >&2
+            exit 1
+          fi
+          git verify-tag "refs/tags/${GITHUB_REF_NAME}"
+          if [ "$(git rev-list -n 1 "refs/tags/${GITHUB_REF_NAME}")" != "$(git rev-parse HEAD)" ]; then
+            echo "Checked-out commit does not match release tag target." >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install npm CLI with staged publishing
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/npm-cache
+        run: |
+          npm install --global "npm@${NPM_CLI_VERSION}" --ignore-scripts --no-audit --no-fund
+          npm --version
+          npm stage --help >/dev/null
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Install npm wrapper dependencies
+        working-directory: npm
+        run: npm ci --ignore-scripts
+
+      - name: Check tag matches npm package version
+        working-directory: npm
+        run: npm run check:tag -- "${GITHUB_REF_NAME}"
+
+      - name: Test npm wrapper
+        working-directory: npm
+        run: npm test
+
+      - name: Build npm package binaries
+        working-directory: npm
+        run: npm run build
+
+      - name: Smoke Linux binary
+        working-directory: npm
+        run: ./dist/linux-x64/shipable version
+
+      - name: Verify npm package allowlist
+        working-directory: npm
+        run: npm run pack:check
+
+  publish:
+    name: Stage npm package with OIDC
+    needs: preflight
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Import release signing public key
+        shell: bash
+        env:
+          RELEASE_GPG_PUBLIC_KEY_B64: ${{ vars.SHIPABLE_RELEASE_GPG_PUBLIC_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_GPG_PUBLIC_KEY_B64}" ]; then
+            echo "Set repository variable SHIPABLE_RELEASE_GPG_PUBLIC_KEY_B64 to the armored release signing public key encoded as base64." >&2
+            exit 1
+          fi
+          printf '%s' "${RELEASE_GPG_PUBLIC_KEY_B64}" | base64 -d | gpg --batch --import
+
+      - name: Verify signed release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "This workflow only publishes tag refs." >&2
+            exit 1
+          fi
+          git fetch --force --tags origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" != "tag" ]; then
+            echo "Release ref ${GITHUB_REF_NAME} must be an annotated signed tag." >&2
+            exit 1
+          fi
+          git verify-tag "refs/tags/${GITHUB_REF_NAME}"
+          if [ "$(git rev-list -n 1 "refs/tags/${GITHUB_REF_NAME}")" != "$(git rev-parse HEAD)" ]; then
+            echo "Checked-out commit does not match release tag target." >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install npm CLI with staged publishing
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/npm-cache
+        run: |
+          npm install --global "npm@${NPM_CLI_VERSION}" --ignore-scripts --no-audit --no-fund
+          npm --version
+          npm stage --help >/dev/null
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Install npm wrapper dependencies
+        working-directory: npm
+        run: npm ci --ignore-scripts
+
+      - name: Check tag matches npm package version
+        working-directory: npm
+        run: npm run check:tag -- "${GITHUB_REF_NAME}"
+
+      - name: Test npm wrapper
+        working-directory: npm
+        run: npm test
+
+      - name: Build npm package binaries
+        working-directory: npm
+        run: npm run build
+
+      - name: Smoke Linux binary
+        working-directory: npm
+        run: ./dist/linux-x64/shipable version
+
+      - name: Verify npm package allowlist
+        working-directory: npm
+        run: npm run pack:check
+
+      - name: Stage npm package
+        working-directory: npm
+        run: npm stage publish . --access public
