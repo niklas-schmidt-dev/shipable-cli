@@ -6,10 +6,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVersionCommandPrintsBuildInfo(t *testing.T) {
@@ -140,6 +143,33 @@ func TestAuthLoginUsesWorkOSDeviceFlowWithoutToken(t *testing.T) {
 	}
 	if cfg.WorkOSClientID != "client_test" {
 		t.Fatalf("client id = %q", cfg.WorkOSClientID)
+	}
+}
+
+func TestStartDeviceFlowUsesProdDefaultClientID(t *testing.T) {
+	client := fakeHTTPClient(func(r *http.Request) (int, string) {
+		body := readRequestBody(t, r)
+		if r.URL.EscapedPath() == "/user_management/authorize/device" {
+			if !strings.Contains(string(body), `"client_id":"client_01KSXAMHC5HC8F6J7D1GZMAA07"`) {
+				t.Fatalf("authorize did not use prod default client id: %s", string(body))
+			}
+			return http.StatusOK, `{"device_code":"dev_1","user_code":"AAAA-BBBB","verification_uri":"https://auth.workos.test/device","expires_in":600,"interval":0}`
+		}
+		t.Fatalf("unexpected request %s %s", r.Method, r.URL.EscapedPath())
+		return http.StatusInternalServerError, ``
+	})
+	rr := runner{
+		client: client,
+		stdout: io.Discard,
+		stderr: io.Discard,
+		env:    map[string]string{"SHIPABLE_WORKOS_API_URL": "https://auth.workos.test"},
+	}
+	flow, err := rr.startDeviceFlow(context.Background(), deviceLoginInput{APIURL: "https://api.shipable.test"})
+	if err != nil {
+		t.Fatalf("startDeviceFlow failed: %v", err)
+	}
+	if flow.clientID != "client_01KSXAMHC5HC8F6J7D1GZMAA07" {
+		t.Fatalf("client id = %q, want prod default", flow.clientID)
 	}
 }
 
@@ -1182,6 +1212,142 @@ func TestReadDotenvValueOnlyRejectsPlaceholderValues(t *testing.T) {
 	writeFile(t, path, "WORKOS_CLIENT_ID=example-client\n")
 	if got := readDotenvValue(path, "WORKOS_CLIENT_ID"); got != "" {
 		t.Fatalf("example-prefixed value = %q, want empty", got)
+	}
+}
+
+func TestRequireSecureURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{name: "https remote", url: "https://api.shipable.test", wantErr: false},
+		{name: "https default", url: defaultAPIURL, wantErr: false},
+		{name: "http localhost", url: "http://localhost:8080", wantErr: false},
+		{name: "http loopback ipv4", url: "http://127.0.0.1:3000", wantErr: false},
+		{name: "http loopback ipv6", url: "http://[::1]:3000", wantErr: false},
+		{name: "http remote rejected", url: "http://api.shipable.test", wantErr: true},
+		{name: "bad scheme rejected", url: "ftp://api.shipable.test", wantErr: true},
+		{name: "empty rejected", url: "", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := requireSecureURL(tc.url)
+			if tc.wantErr && err == nil {
+				t.Fatalf("requireSecureURL(%q) = nil, want error", tc.url)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("requireSecureURL(%q) = %v, want nil", tc.url, err)
+			}
+		})
+	}
+}
+
+func TestSecureRedirectPolicy(t *testing.T) {
+	mustURL := func(raw string) *url.URL {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		return parsed
+	}
+	newHop := func(target string, withAuth bool) *http.Request {
+		req, err := http.NewRequest(http.MethodGet, target, nil)
+		if err != nil {
+			t.Fatalf("new request %q: %v", target, err)
+		}
+		if withAuth {
+			req.Header.Set("Authorization", "Bearer token_secret")
+		}
+		return req
+	}
+
+	t.Run("rejects https to http downgrade on same host", func(t *testing.T) {
+		req := newHop("http://api.shipable.test/login", true)
+		via := []*http.Request{{URL: mustURL("https://api.shipable.test/v1/session")}}
+		if err := secureRedirectPolicy(req, via); err == nil {
+			t.Fatal("secureRedirectPolicy allowed https->http downgrade, want error")
+		}
+	})
+
+	t.Run("rejects unsupported scheme", func(t *testing.T) {
+		req := newHop("ftp://api.shipable.test/login", true)
+		via := []*http.Request{{URL: mustURL("https://api.shipable.test/v1/session")}}
+		if err := secureRedirectPolicy(req, via); err == nil {
+			t.Fatal("secureRedirectPolicy allowed ftp scheme, want error")
+		}
+	})
+
+	t.Run("strips auth on host change", func(t *testing.T) {
+		req := newHop("https://evil.example.test/login", true)
+		via := []*http.Request{{URL: mustURL("https://api.shipable.test/v1/session")}}
+		if err := secureRedirectPolicy(req, via); err != nil {
+			t.Fatalf("secureRedirectPolicy(host change) = %v, want nil", err)
+		}
+		if got := req.Header.Get("Authorization"); got != "" {
+			t.Fatalf("Authorization not stripped on host change: %q", got)
+		}
+	})
+
+	t.Run("preserves auth on same origin", func(t *testing.T) {
+		req := newHop("https://api.shipable.test/v1/session/", true)
+		via := []*http.Request{{URL: mustURL("https://api.shipable.test/v1/session")}}
+		if err := secureRedirectPolicy(req, via); err != nil {
+			t.Fatalf("secureRedirectPolicy(same origin) = %v, want nil", err)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer token_secret" {
+			t.Fatalf("Authorization changed on same origin: %q", got)
+		}
+	})
+
+	t.Run("stops after too many redirects", func(t *testing.T) {
+		req := newHop("https://api.shipable.test/v1/session", true)
+		via := make([]*http.Request, 10)
+		if err := secureRedirectPolicy(req, via); err == nil {
+			t.Fatal("secureRedirectPolicy allowed 11th redirect, want error")
+		}
+	})
+}
+
+func TestAPIRequestDoesNotLeakTokenOnSchemeDowngradeRedirect(t *testing.T) {
+	// End-to-end: a same-host https->http redirect must not carry the bearer
+	// token. httptest binds both servers to loopback, where plaintext http is
+	// permitted by requireSecureURL, so the load-bearing defense here is the
+	// Authorization strip on the scheme change. The default client wires
+	// secureRedirectPolicy, so even when the downgraded hop is followed the
+	// token is removed before the request hits the plaintext channel.
+	var sawAuthOverHTTP bool
+	insecure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "" {
+			sawAuthOverHTTP = true
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer insecure.Close()
+
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "Bearer token_secret" {
+			t.Errorf("initial https hop missing auth header: %q", req.Header.Get("Authorization"))
+		}
+		http.Redirect(w, req, insecure.URL+req.URL.Path, http.StatusFound)
+	}))
+	defer secure.Close()
+
+	transport := secure.Client().Transport
+	client := &http.Client{
+		Timeout:       30 * time.Second,
+		Transport:     transport,
+		CheckRedirect: secureRedirectPolicy,
+	}
+
+	if err := (runner{client: client}).apiJSON(context.Background(), configFile{
+		APIURL:      secure.URL,
+		AccessToken: "token_secret",
+	}, http.MethodGet, "/v1/session", nil, nil); err != nil {
+		t.Fatalf("apiJSON over loopback downgrade = %v, want nil", err)
+	}
+	if sawAuthOverHTTP {
+		t.Fatal("bearer token leaked to plaintext http endpoint via redirect")
 	}
 }
 

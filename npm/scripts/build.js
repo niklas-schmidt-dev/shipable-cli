@@ -67,16 +67,35 @@ const commit =
   commandOutput("git", ["rev-parse", "--short=12", "HEAD"]) ||
   "unknown";
 const builtAt = process.env.SHIPABLE_CLI_BUILD_DATE || buildDate();
-const ldflags = [
+const pkg = "github.com/niklas-schmidt-dev/shipable-cli/internal/shipablecli";
+const ldflagParts = [
   "-s",
   "-w",
   "-X",
-  `github.com/niklas-schmidt-dev/shipable-cli/internal/shipablecli.version=${version}`,
+  `${pkg}.version=${version}`,
   "-X",
-  `github.com/niklas-schmidt-dev/shipable-cli/internal/shipablecli.commit=${commit}`,
+  `${pkg}.commit=${commit}`,
   "-X",
-  `github.com/niklas-schmidt-dev/shipable-cli/internal/shipablecli.buildDate=${builtAt}`
-].join(" ");
+  `${pkg}.buildDate=${builtAt}`
+];
+// Optionally override the source-default public WorkOS device-flow client id
+// and WorkOS API base for staging/test release builds. The production default is
+// committed in source so source-built installs such as Homebrew work too.
+const workosClientID = process.env.SHIPABLE_WORKOS_CLIENT_ID || "";
+if (workosClientID) {
+  ldflagParts.push("-X", `${pkg}.defaultWorkOSClientID=${workosClientID}`);
+}
+const workosAPIURL = process.env.SHIPABLE_WORKOS_API_URL || "";
+if (workosAPIURL) {
+  ldflagParts.push("-X", `${pkg}.defaultWorkOSAPIURL=${workosAPIURL}`);
+}
+// Optional: point the TUI's "official" backend somewhere other than the
+// hardcoded https://api.shipable.de default (e.g. a staging build).
+const officialAPIURL = process.env.SHIPABLE_OFFICIAL_API_URL || "";
+if (officialAPIURL) {
+  ldflagParts.push("-X", `${pkg}.officialAPIURL=${officialAPIURL}`);
+}
+const ldflags = ldflagParts.join(" ");
 
 fs.rmSync(distRoot, { force: true, recursive: true });
 fs.mkdirSync(distRoot, { recursive: true });

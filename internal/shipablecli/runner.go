@@ -25,9 +25,14 @@ import (
 )
 
 const (
-	// Defaults to HTTPS so auth tokens are not sent in clear text. Local
-	// development can override this with --api-url or SHIPABLE_API_URL.
-	defaultAPIURL          = "https://localhost:8080"
+	// defaultAPIURL is the production Shipable API. It is the endpoint used when
+	// nothing else is configured, so an installed CLI talks to production out of
+	// the box. Local development overrides it with --api-url, SHIPABLE_API_URL,
+	// or the TUI backend switcher.
+	defaultAPIURL = "https://api.shipable.de"
+	// defaultLocalAPIURL is the dev backend the TUI offers as the "local"
+	// environment; override with SHIPABLE_LOCAL_API_URL.
+	defaultLocalAPIURL     = "http://localhost:8080"
 	defaultPoll            = 2 * time.Second
 	maxSyncFileSize        = 10 << 20
 	maxErrorResponseLength = 200
@@ -42,6 +47,10 @@ type RunOptions struct {
 	Env    map[string]string
 	Client *http.Client
 	Exec   func(name string, args []string, options execOptions) error
+	// Report, when set, receives progress/result Events from long-running
+	// engine operations. Defaults to a discardReporter so the headless CLI is
+	// unaffected. The TUI installs its own reporter.
+	Report Reporter
 }
 
 type execOptions struct {
@@ -74,6 +83,7 @@ type runner struct {
 	env    map[string]string
 	client *http.Client
 	exec   func(name string, args []string, options execOptions) error
+	report Reporter
 }
 
 func Run(options RunOptions) error {
@@ -85,14 +95,23 @@ func Run(options RunOptions) error {
 		env:    options.Env,
 		client: options.Client,
 		exec:   options.Exec,
+		report: options.Report,
 	}
 	if r.stdin == nil {
 		r.stdin = os.Stdin
 	}
+	if r.report == nil {
+		r.report = discardReporter{}
+	}
 	if r.client == nil {
 		r.client = &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:       30 * time.Second,
+			CheckRedirect: secureRedirectPolicy,
 		}
+	} else if r.client.CheckRedirect == nil {
+		// Callers that inject their own client (e.g. the TUI or tests) still
+		// get the credential-safe redirect policy unless they set their own.
+		r.client.CheckRedirect = secureRedirectPolicy
 	}
 	if r.exec == nil {
 		r.exec = defaultExec
@@ -129,6 +148,8 @@ func (r runner) run() error {
 		return r.runServiceLogs(r.args[1:])
 	case "dev":
 		return r.runDev(r.args[1:])
+	case "ui", "tui":
+		return r.runUI(r.args[1:])
 	case "help", "-h", "--help":
 		return r.usage()
 	default:
@@ -142,7 +163,7 @@ func (r runner) runVersion() error {
 }
 
 func (r runner) usage() error {
-	_, _ = fmt.Fprintln(r.stdout, "Usage: shipable <auth|templates|create|link|sync|deploy|pull|generate|status|logs|dev|version> [options]")
+	_, _ = fmt.Fprintln(r.stdout, "Usage: shipable <auth|templates|create|link|sync|deploy|pull|generate|status|logs|dev|ui|version> [options]")
 	_, _ = fmt.Fprintln(r.stdout, "")
 	_, _ = fmt.Fprintln(r.stdout, "Commands:")
 	_, _ = fmt.Fprintln(r.stdout, "  version")
@@ -159,6 +180,7 @@ func (r runner) usage() error {
 	_, _ = fmt.Fprintln(r.stdout, "  status [--project <project-id>] [--dir <path>] [--json]")
 	_, _ = fmt.Fprintln(r.stdout, "  logs [--project <project-id>] [--dir <path>] [--target preview|production] [--deployment <deployment-id>] [--component <component-id>] [--follow]")
 	_, _ = fmt.Fprintln(r.stdout, "  dev up")
+	_, _ = fmt.Fprintln(r.stdout, "  ui                                          # interactive terminal UI (requires a TTY; build with -tags tui)")
 	return nil
 }
 
@@ -194,11 +216,8 @@ func (r runner) runAuth(args []string) error {
 				WorkOSAPIURL: *workOSBase,
 			})
 		}
-		cfg := configFile{APIURL: strings.TrimRight(strings.TrimSpace(*apiURL), "/"), AccessToken: trimmedToken}
-		if cfg.APIURL == "" {
-			cfg.APIURL = defaultAPIURL
-		}
-		if err := writeJSONFile(r.configPath(), cfg, 0o600); err != nil {
+		cfg, err := r.saveTokenConfig(trimmedToken, *apiURL)
+		if err != nil {
 			return err
 		}
 		_, _ = fmt.Fprintf(r.stdout, "Authenticated for %s\n", cfg.APIURL)
@@ -243,10 +262,57 @@ type tokenResponse struct {
 	ErrorDescription string `json:"error_description"`
 }
 
-func (r runner) runDeviceLogin(ctx context.Context, input deviceLoginInput) error {
+// saveTokenConfig persists a directly-supplied access token (the non-browser
+// auth path) and returns the stored config. Shared by `auth login` and the TUI
+// token-login screen so both behave identically.
+func (r runner) saveTokenConfig(token string, apiURL string) (configFile, error) {
+	cfg := configFile{APIURL: strings.TrimRight(strings.TrimSpace(apiURL), "/"), AccessToken: strings.TrimSpace(token)}
+	if cfg.APIURL == "" {
+		cfg.APIURL = defaultAPIURL
+	}
+	if cfg.AccessToken == "" {
+		return configFile{}, errors.New("missing access token")
+	}
+	if err := requireSecureURL(cfg.APIURL); err != nil {
+		return configFile{}, err
+	}
+	if err := writeJSONFile(r.configPath(), cfg, 0o600); err != nil {
+		return configFile{}, err
+	}
+	return cfg, nil
+}
+
+// deviceFlow holds the resolved parameters and authorize response for an
+// in-progress WorkOS device-authorization login. It is produced by
+// startDeviceFlow and consumed by completeDeviceFlow, so both the headless CLI
+// and the TUI can drive the same flow: resolve+authorize, show the user code,
+// then poll+persist.
+type deviceFlow struct {
+	apiURL     string
+	clientID   string
+	workOSBase string
+	device     deviceAuthorizeResponse
+}
+
+// deviceVerificationURL returns the URL the user should open, preferring the
+// complete variant that embeds the user code.
+func (f deviceFlow) deviceVerificationURL() string {
+	if f.device.VerificationURIComplete != "" {
+		return f.device.VerificationURIComplete
+	}
+	return f.device.VerificationURI
+}
+
+// startDeviceFlow resolves the API/client/WorkOS parameters and performs the
+// device-authorization request, returning the parameters and the device code
+// to display. It performs no terminal I/O so a TUI can render the result.
+func (r runner) startDeviceFlow(ctx context.Context, input deviceLoginInput) (deviceFlow, error) {
 	apiURL := strings.TrimRight(strings.TrimSpace(input.APIURL), "/")
 	if apiURL == "" {
 		apiURL = defaultAPIURL
+	}
+	if err := requireSecureURL(apiURL); err != nil {
+		return deviceFlow{}, err
 	}
 	clientID := strings.TrimSpace(input.ClientID)
 	if clientID == "" {
@@ -259,11 +325,17 @@ func (r runner) runDeviceLogin(ctx context.Context, input deviceLoginInput) erro
 		clientID = discoverWorkOSClientID(".")
 	}
 	if clientID == "" {
-		return errors.New("missing WorkOS client id; pass --client-id, set SHIPABLE_WORKOS_CLIENT_ID, or configure apps/api/.env")
+		clientID = strings.TrimSpace(defaultWorkOSClientID)
+	}
+	if clientID == "" {
+		return deviceFlow{}, errors.New("missing WorkOS client id; pass --client-id, set SHIPABLE_WORKOS_CLIENT_ID, or build with a baked-in default (see README)")
 	}
 	workOSBase := strings.TrimRight(strings.TrimSpace(input.WorkOSAPIURL), "/")
 	if workOSBase == "" {
 		workOSBase = strings.TrimRight(strings.TrimSpace(r.getenv("SHIPABLE_WORKOS_API_URL")), "/")
+	}
+	if workOSBase == "" {
+		workOSBase = strings.TrimRight(strings.TrimSpace(defaultWorkOSAPIURL), "/")
 	}
 	if workOSBase == "" {
 		workOSBase = workOSAPIURL
@@ -273,32 +345,48 @@ func (r runner) runDeviceLogin(ctx context.Context, input deviceLoginInput) erro
 	if err := r.workOSJSON(ctx, workOSBase, "/user_management/authorize/device", map[string]string{
 		"client_id": clientID,
 	}, &device); err != nil {
-		return err
+		return deviceFlow{}, err
 	}
 	if device.DeviceCode == "" {
-		return errors.New("WorkOS device auth response did not include device_code")
+		return deviceFlow{}, errors.New("WorkOS device auth response did not include device_code")
 	}
-	verificationURL := device.VerificationURIComplete
-	if verificationURL == "" {
-		verificationURL = device.VerificationURI
-	}
-	_, _ = fmt.Fprintf(r.stdout, "Open: %s\nCode: %s\nWaiting for browser approval...\n", verificationURL, device.UserCode)
+	flow := deviceFlow{apiURL: apiURL, clientID: clientID, workOSBase: workOSBase, device: device}
+	dev := device
+	r.emit(Event{Kind: EvtDeviceCode, Command: "login", Device: &dev})
+	return flow, nil
+}
 
-	token, err := r.pollDeviceToken(ctx, workOSBase, clientID, device)
+// completeDeviceFlow polls WorkOS until the device authorization is approved,
+// then persists the resulting config. It performs no terminal I/O.
+func (r runner) completeDeviceFlow(ctx context.Context, flow deviceFlow) (configFile, error) {
+	token, err := r.pollDeviceToken(ctx, flow.workOSBase, flow.clientID, flow.device)
 	if err != nil {
-		return err
+		return configFile{}, err
 	}
 	expiresAt := accessTokenExpiresAt(token.AccessToken, token.ExpiresIn)
 	cfg := configFile{
-		APIURL:               apiURL,
+		APIURL:               flow.apiURL,
 		AccessToken:          token.AccessToken,
 		RefreshToken:         token.RefreshToken,
 		OrganizationID:       token.OrganizationID,
-		WorkOSClientID:       clientID,
-		WorkOSAPIURL:         workOSBase,
+		WorkOSClientID:       flow.clientID,
+		WorkOSAPIURL:         flow.workOSBase,
 		AccessTokenExpiresAt: expiresAt,
 	}
 	if err := writeJSONFile(r.configPath(), cfg, 0o600); err != nil {
+		return configFile{}, err
+	}
+	return cfg, nil
+}
+
+func (r runner) runDeviceLogin(ctx context.Context, input deviceLoginInput) error {
+	flow, err := r.startDeviceFlow(ctx, input)
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(r.stdout, "Open: %s\nCode: %s\nWaiting for browser approval...\n", flow.deviceVerificationURL(), flow.device.UserCode)
+	cfg, err := r.completeDeviceFlow(ctx, flow)
+	if err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(r.stdout, "Authenticated for %s\n", cfg.APIURL)
@@ -761,6 +849,9 @@ func (r runner) apiJSON(ctx context.Context, cfg configFile, method string, apiP
 		}
 		requestBody = bytes.NewReader(content)
 	}
+	if err := requireSecureURL(cfg.APIURL); err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(cfg.APIURL, "/")+apiPath, requestBody)
 	if err != nil {
 		return err
@@ -792,14 +883,24 @@ func (r runner) apiJSON(ctx context.Context, cfg configFile, method string, apiP
 	return nil
 }
 
-func (r runner) apiStream(ctx context.Context, cfg configFile, apiPath string, target io.Writer) error {
+func (r runner) apiStream(ctx context.Context, cfg configFile, apiPath string, target io.Writer, follow bool) error {
+	if err := requireSecureURL(cfg.APIURL); err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(cfg.APIURL, "/")+apiPath, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.AccessToken)
 	req.Header.Set("Accept", "text/plain")
-	resp, err := r.client.Do(req)
+	// Long-lived follow streams must not be killed by the shared client's
+	// request timeout. Use a timeout-free client and rely on the
+	// signal/context-cancellable request context to terminate the stream.
+	client := r.client
+	if follow {
+		client = r.streamingClient()
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -815,7 +916,92 @@ func (r runner) apiStream(ctx context.Context, cfg configFile, apiPath string, t
 	return err
 }
 
+// streamingClient returns an http.Client without a request timeout for
+// long-lived follow streams. It reuses the configured client's Transport so
+// any test or custom RoundTripper still applies; cancellation is driven by the
+// request context (e.g. the signal-aware context used by logs --follow).
+func (r runner) streamingClient() *http.Client {
+	checkRedirect := r.client.CheckRedirect
+	if checkRedirect == nil {
+		checkRedirect = secureRedirectPolicy
+	}
+	return &http.Client{
+		Transport:     r.client.Transport,
+		CheckRedirect: checkRedirect,
+		Jar:           r.client.Jar,
+	}
+}
+
+// requireSecureURL ensures a base URL only carries a bearer token over a
+// confidential channel. https:// is always allowed; http:// is allowed only
+// for loopback hosts (localhost, 127.0.0.1, ::1) so local development keeps
+// working. Any other scheme or a plaintext http:// to a remote host is
+// rejected so the token is never attached to the request.
+func requireSecureURL(rawURL string) error {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return errors.New("missing URL")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("invalid URL %q: %w", trimmed, err)
+	}
+	switch parsed.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(parsed.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("refusing to send credentials over plaintext http to non-loopback host %q; use https", trimmed)
+	default:
+		return fmt.Errorf("refusing to send credentials to unsupported URL scheme %q; use https", parsed.Scheme)
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
+}
+
+// secureRedirectPolicy guards every redirect hop so a bearer token is never
+// leaked over an insecure channel. Go's default policy follows redirects and
+// only strips the Authorization header when the host changes, so a same-host
+// https:// -> http:// downgrade would otherwise carry the token in clear text.
+// This policy (a) refuses any hop whose target is not a confidential URL
+// (rejecting plaintext http to a non-loopback host or an unsupported scheme),
+// and (b) strips the Authorization header on any host OR scheme change so it is
+// only ever resent to the exact origin that was first authenticated.
+func secureRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if err := requireSecureURL(req.URL.String()); err != nil {
+		return err
+	}
+	if len(via) > 0 {
+		previous := via[len(via)-1].URL
+		if !sameOrigin(previous, req.URL) {
+			req.Header.Del("Authorization")
+		}
+	}
+	return nil
+}
+
+// sameOrigin reports whether two URLs share the same scheme and host, so that
+// credentials are only resent across a redirect when the origin is unchanged.
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+}
+
 func (r runner) workOSJSON(ctx context.Context, baseURL string, apiPath string, body any, target any) error {
+	if err := requireSecureURL(baseURL); err != nil {
+		return err
+	}
 	content, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -830,6 +1016,9 @@ func (r runner) workOSJSON(ctx context.Context, baseURL string, apiPath string, 
 }
 
 func (r runner) workOSForm(ctx context.Context, baseURL string, apiPath string, values url.Values, target any) error {
+	if err := requireSecureURL(baseURL); err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+apiPath, strings.NewReader(values.Encode()))
 	if err != nil {
 		return err

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -123,6 +124,16 @@ type readinessCheckInfo struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
 	Action  string `json:"action,omitempty"`
+}
+
+// statusReport is the assembled project status the status command renders and
+// the TUI consumes. The json tags are kept identical to the previous inline
+// struct in runStatus so `status --json` output stays byte-for-byte the same.
+type statusReport struct {
+	Project    projectInfo    `json:"project"`
+	Readiness  readinessInfo  `json:"readiness"`
+	Preview    deploymentInfo `json:"preview,omitempty"`
+	Production deploymentInfo `json:"production,omitempty"`
 }
 
 func (r runner) runTemplates(args []string) error {
@@ -407,20 +418,10 @@ func (r runner) runStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	status := struct {
-		Project    projectInfo    `json:"project"`
-		Readiness  readinessInfo  `json:"readiness"`
-		Preview    deploymentInfo `json:"preview,omitempty"`
-		Production deploymentInfo `json:"production,omitempty"`
-	}{}
-	if err := r.apiJSON(context.Background(), cfg, http.MethodGet, "/v1/projects/"+encodeID(resolvedProjectID), nil, &status.Project); err != nil {
+	status, err := r.fetchStatus(context.Background(), cfg, resolvedProjectID)
+	if err != nil {
 		return err
 	}
-	if err := r.apiJSON(context.Background(), cfg, http.MethodGet, "/v1/projects/"+encodeID(resolvedProjectID)+"/readiness", nil, &status.Readiness); err != nil {
-		return err
-	}
-	_ = r.apiJSON(context.Background(), cfg, http.MethodGet, "/v1/projects/"+encodeID(resolvedProjectID)+"/preview", nil, &status.Preview)
-	_ = r.apiJSON(context.Background(), cfg, http.MethodGet, "/v1/projects/"+encodeID(resolvedProjectID)+"/production", nil, &status.Production)
 	if *jsonOutput {
 		content, err := json.MarshalIndent(status, "", "  ")
 		if err != nil {
@@ -515,7 +516,15 @@ func (r runner) runServiceLogs(args []string) error {
 	if encoded := query.Encode(); encoded != "" {
 		apiPath += "?" + encoded
 	}
-	return r.apiStream(context.Background(), cfg, apiPath, r.stdout)
+	ctx := context.Background()
+	if *follow {
+		// Follow streams are long-lived and use a timeout-free client, so the
+		// request context is the only way to stop them. Cancel on Ctrl-C.
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(ctx, os.Interrupt)
+		defer stop()
+	}
+	return r.apiStream(ctx, cfg, apiPath, r.stdout, *follow)
 }
 
 func (r runner) fetchTemplateFiles(ctx context.Context, cfg configFile, id string) (templateFilesResponse, error) {
@@ -546,6 +555,23 @@ func (r runner) fetchProjectFiles(ctx context.Context, cfg configFile, projectID
 		return files[i].Path < files[j].Path
 	})
 	return files, nil
+}
+
+// fetchStatus assembles the project status used by both `status` and the TUI.
+// It deliberately swallows errors from the preview/production deployment
+// lookups (they 404 before a first deploy), returning a partial report — the
+// same behavior the inline runStatus assembly had.
+func (r runner) fetchStatus(ctx context.Context, cfg configFile, projectID string) (statusReport, error) {
+	var status statusReport
+	if err := r.apiJSON(ctx, cfg, http.MethodGet, "/v1/projects/"+encodeID(projectID), nil, &status.Project); err != nil {
+		return statusReport{}, err
+	}
+	if err := r.apiJSON(ctx, cfg, http.MethodGet, "/v1/projects/"+encodeID(projectID)+"/readiness", nil, &status.Readiness); err != nil {
+		return statusReport{}, err
+	}
+	_ = r.apiJSON(ctx, cfg, http.MethodGet, "/v1/projects/"+encodeID(projectID)+"/preview", nil, &status.Preview)
+	_ = r.apiJSON(ctx, cfg, http.MethodGet, "/v1/projects/"+encodeID(projectID)+"/production", nil, &status.Production)
+	return status, nil
 }
 
 func (r runner) fetchDeployment(ctx context.Context, cfg configFile, projectID string, target string) (deploymentInfo, error) {
@@ -674,10 +700,13 @@ func (r runner) waitForLatestJob(ctx context.Context, cfg configFile, projectID 
 		if err := r.apiJSON(ctx, cfg, http.MethodGet, "/v1/projects/"+encodeID(projectID)+"/jobs/latest", nil, &last); err != nil {
 			return latestJobInfo{}, err
 		}
+		job := last
+		r.emit(Event{Kind: EvtJobPolled, Command: "build", Status: last.Status, Job: &job})
 		if terminalJobStatus(last.Status) {
 			if last.Status != "succeeded" {
 				return last, fmt.Errorf("job %s %s: %s", last.ID, last.Status, strings.TrimSpace(last.Error))
 			}
+			r.emit(Event{Kind: EvtJobSucceeded, Command: "build", Status: last.Status, Job: &job})
 			_, _ = fmt.Fprintf(r.stdout, "Build job %s succeeded\n", last.ID)
 			return last, nil
 		}
@@ -698,7 +727,10 @@ func (r runner) waitForDeployment(ctx context.Context, cfg configFile, projectID
 		if err := r.apiJSON(ctx, cfg, http.MethodGet, apiPath, nil, &deployment); err != nil {
 			return deploymentInfo{}, err
 		}
+		dep := deployment
+		r.emit(Event{Kind: EvtDeploymentPolled, Command: "deploy", Target: target, Status: deployment.Status, Deployment: &dep})
 		if deploymentReady(deployment) {
+			r.emit(Event{Kind: EvtDeploymentReady, Command: "deploy", Target: target, Status: deployment.Status, Deployment: &dep})
 			r.printDeploymentEndpoints(deploymentLabel(target), deployment)
 			return deployment, nil
 		}
@@ -724,10 +756,13 @@ func (r runner) waitForGeneration(ctx context.Context, cfg configFile, projectID
 		if generationID != "" && run.ID != "" && run.ID != generationID {
 			return run, fmt.Errorf("latest generation is %s, expected %s", run.ID, generationID)
 		}
+		gen := run
+		r.emit(Event{Kind: EvtGenerationPolled, Command: "generate", Status: run.Status, Generation: &gen})
 		if terminalGenerationStatus(run.Status) {
 			if run.Status != "succeeded" {
 				return run, fmt.Errorf("generation %s %s: %s", run.ID, run.Status, strings.TrimSpace(run.Error))
 			}
+			r.emit(Event{Kind: EvtGenerationSucceeded, Command: "generate", Status: run.Status, Generation: &gen})
 			_, _ = fmt.Fprintf(r.stdout, "Generation %s succeeded\n", run.ID)
 			return run, nil
 		}

@@ -6,3 +6,6 @@ node_modules/
 .env
 .env.*
 !.env.example
+
+# Local TUI build artifact (go build -tags tui -o shipable ./cmd/shipable)
+/shipable
