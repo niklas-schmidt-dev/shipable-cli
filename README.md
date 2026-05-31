@@ -5,6 +5,16 @@ preview, and deployment workflows.
 
 ## Install
 
+With Homebrew:
+
+```bash
+brew tap niklas-schmidt-dev/shipable
+brew install shipable
+shipable version
+```
+
+Or with npm:
+
 ```bash
 npm install -g @shipable/cli
 shipable version
